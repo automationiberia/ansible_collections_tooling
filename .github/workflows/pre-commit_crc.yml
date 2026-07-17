@@ -1,6 +1,10 @@
 ---
 # This workflow action will run pre-commit, which will execute ansible and yaml linting
 # See .pre-commit-config.yaml for what hooks are executed
+#
+# Fork pull_request runs do not receive Automation Hub secrets. Push/schedule runs
+# (with secrets) populate the Ansible collections cache; fork PRs restore that cache
+# and install offline.
 name: pre-commit tests
 
 
@@ -34,17 +38,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # This tells the action to pull from the branch that created the PR
-          ref: ${{ github.event.pull_request.head.sha }}
-          # This ensures it works even if the PR comes from a fork
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          # Prefer PR head (incl. forks); fall back for push/schedule cache warming.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.14'
       - name: Install Ansible
         run: pip install --upgrade "ansible-core>=2.20" pyyaml==6.0.1
+      - name: Cache Ansible collections
+        uses: actions/cache@v4
+        with:
+          path: ~/.ansible/collections
+          key: ansible-collections-${{ runner.os }}-${{ hashFiles('galaxy.yml', '**/requirements*.yml', '**/requirements*.yaml') }}
+          restore-keys: |
+            ansible-collections-${{ runner.os }}-
       - name: Install collection
-        run: ansible-galaxy collection install . -vvvv
+        run: |
+          set -euo pipefail
+          if [ -n "${ANSIBLE_GALAXY_SERVER_PUBLISHED_TOKEN:-}" ]; then
+            ansible-galaxy collection install . -vvvv
+          else
+            echo "No Automation Hub token available (typical for fork pull_request)."
+            echo "Installing from the restored Ansible collections cache (--offline)."
+            if ! ansible-galaxy collection install . --offline -vvvv; then
+              echo "::error::Offline collection install failed. Push/schedule runs must populate the Ansible collections cache (with CRC_PUBLISH_KEY) before fork PRs can use it."
+              exit 1
+            fi
+          fi
         shell: bash
         env:
           ANSIBLE_GALAXY_SERVER_VALIDATED_URL: 'https://console.redhat.com/api/automation-hub/content/validated/'
